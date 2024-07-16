@@ -1,0 +1,13 @@
+[
+    {
+        "process_name": "untitled_test",
+        "process_wasm_path": "/untitled_test.wasm",
+        "on_exit": "Restart",
+        "request_networking": false,
+        "request_capabilities": [],
+        "grant_capabilities": [
+            "untitled:untitled:template.os"
+        ],
+        "public": true
+    }
+]
