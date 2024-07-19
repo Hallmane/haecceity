@@ -1,14 +1,17 @@
-use std::fs;
-use std::collections::HashSet;
-use kinode_process_lib::{await_message, call_init, Address, Message, Request, Response, get_blob, println, clear_state,
-                        http::{serve_ui, bind_http_path, bind_ws_path},
-                        vfs::{create_drive, open_dir}
-                    };
+use kinode_process_lib::{
+    await_message, get_typed_state, get_blob, call_init, http::{
+        bind_http_path, bind_ws_path, send_response, send_ws_push, serve_ui, HttpServerRequest,
+        StatusCode, WsMessageType,
+    }, our_capabilities, println, set_state, spawn, vfs::{
+        create_drive, create_file, metadata, open_dir, open_file, remove_file, Directory, FileType
+    }, Address, LazyLoadBlob, Message, OnExit, ProcessId, Request, Response
+};
+use serde_json;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 
 mod structs;
-use structs::{SongDb, SongDbRequest, SongDbResponse, MP3File, Song, Tag};
-
-
+use structs::{SongDb, SongDbRequest, SongDbResponse, Song, Tag};
 
 wit_bindgen::generate!({
     path: "target/wit",
@@ -17,155 +20,269 @@ wit_bindgen::generate!({
 
 call_init!(init);
 fn init(our: Address) {
-    println!("begin");
+    println!("P2P Music Sharing: Initializing");
 
-    //clear_state();
+    let drive_path = create_drive(our.package_id(), "music_db", None).unwrap();
+    let files_dir = open_dir(&drive_path, false, None).unwrap();
+    let mut song_db = SongDb::load(&files_dir);
+    let mut ws_channels: HashSet<u32> = HashSet::new();
 
-    //let drive_path = create_drive(our.package_id(), "record_shop", None).unwrap();
-    let drive_path = match create_drive(our.package_id(), "record_shop", None) {
-        Ok(path) => path,
-        Err(e) => {
-            println!("Error creating drive: {:?}. Attempting to open existing drive.", e);
-            format!("{}/record_shop", our.package_id())
-        }
-    };
+    // Serve UI files
+    serve_ui(&our, "ui", true, false, vec!["/"]).unwrap();
 
-    //let vfs_dir = open_dir(&drive_path, true, Some(5)).unwrap();
-    let vfs_dir = match open_dir(&drive_path, false, None) {
-        Ok(dir) => dir,
-        Err(e) => {
-            println!("Error opening directory: \n{:?}. \nExiting.", e);
-            return;
-        }
-    };
+    // Bind HTTP paths
+    bind_http_path("/get_songs_from_tag", true, false).unwrap();
+    bind_http_path("/upload_song", true, false).unwrap();
+    bind_http_path("/list_all_songs", true, false).unwrap();
+    bind_http_path("/stream_audio", true, false).unwrap();
 
-
-    let mut song_db = SongDb::new(&vfs_dir);
-
-    match add_local_files_to_vfs(&mut song_db, "music_files") {
-        Ok(_) => print!("local files added to vfs"),
-        Err(_) => print!("error adding the local files to the vfs called: {:?}", song_db),
-    }
-
-    //let file = open_file(&file_path, true);
-    //let file_path = format!("{}/hello.txt", &drive_path);
-
-
-    //let mut message_archive: MessageArchive = HashMap::new();
-    let mut channel_id = 0;
-
-    // Bind UI files to routes; index.html is bound to "/"
-    serve_ui(&our, "ui", true, true, vec!["/"]).unwrap();
-
-    // front end api end points
-    bind_http_path("/get_songs_from_key", true, false).unwrap(); // front end hits this api endpoint with a query (tag key) and receives the matched songs.
-
-    // Bind WebSocket path 
+    // Bind WebSocket path
     bind_ws_path("/", true, false).unwrap();
 
     loop {
-        match handle_message(&our, &mut channel_id, &mut song_db) {
+        match handle_message(&our, &mut song_db, &mut ws_channels) {
             Ok(()) => {}
             Err(e) => {
-                println!("error: {:?}", e);
+                println!("Error: {:?}", e);
+                push_update_via_ws(&ws_channels, &format!("Error: {:?}", e));
             }
-        };
+        }
     }
 }
 
-fn handle_message(our: &Address, channel_id: &mut u64, song_db: &mut SongDb) -> anyhow::Result<()> {
-    //let message = await_message(channel_id).unwrap();
+fn handle_message(
+    our: &Address,
+    song_db: &mut SongDb,
+    ws_channels: &mut HashSet<u32>,
+) -> anyhow::Result<()> {
     let message = await_message()?;
 
-    if message.source().node != our.node {
-        return Ok(()); // ignore messages from other nodes for now
-    }
-
     match message {
-        Message::Request { ref body, ..} => { handle_request(song_db, body) }
+        Message::Request { source, body, .. } => {
+            if source.process.to_string() == "http_server:distro:sys" {
+                handle_http_request(our, &source, &body, song_db, ws_channels)
+            } else {
+                handle_songdb_request(our, &source, &body, song_db, ws_channels)
+            }
+        }
         Message::Response { .. } => Ok(()),
-        _ => { return Err(anyhow::anyhow!("unhandled message type")) }
     }
 }
 
-fn handle_request(song_db: &mut SongDb, body: &[u8]) -> anyhow::Result<()> {
-    let request : SongDbRequest = serde_json::from_slice(body)?;
+fn handle_songdb_request(
+    our: &Address,
+    source: &Address,
+    body: &[u8],
+    song_db: &mut SongDb,
+    ws_channels: &mut HashSet<u32>,
+) -> anyhow::Result<()> {
+    let request = serde_json::from_slice::<SongDbRequest>(body)?;
 
-    let response = match request {
+    match request {
         SongDbRequest::GetSongsByTag(tag) => {
-            match song_db.get_songs_by_tag(&tag) {
-                Some(songs) => {
-                    let songs_without_data: Vec<Song> = songs.iter().map(|s| Song {
-                        id: s.id.clone(),
-                        name: s.name.clone(),
-                        data: vec![],
-                        tag: s.tag.clone(),
-                    }).collect();
-                    SongDbResponse::Songs(songs_without_data)
-                },
-                None => SongDbResponse::Songs(vec![]),
+            let songs = song_db.get_songs_by_tag(&tag);
+            Response::new()
+                .body(serde_json::to_vec(&SongDbResponse::Songs(songs))?)
+                .send()?;
+        }
+        SongDbRequest::UploadSong(upload_request) => {
+            let blob = get_blob().ok_or_else(|| anyhow::anyhow!("No blob provided for song upload"))?;
+            let song = Song {
+                id: format!("{}.mp3", upload_request.name),
+                name: upload_request.name,
+                data: blob.bytes,
+                tag: upload_request.tag,
+            };
+            match song_db.add_song(song) {
+                Ok(_) => {
+                    Response::new()
+                        .body(serde_json::to_vec(&SongDbResponse::SongAdded)?)
+                        .send()?;
+                    push_update_via_ws(ws_channels, "Song uploaded successfully");
+                }
+                Err(e) => {
+                    Response::new()
+                        .body(serde_json::to_vec(&SongDbResponse::Error(format!("Failed to upload song: {}", e)))?)
+                        .send()?;
+                }
             }
         }
-
-        // this should be matched when the front end sends a play request.
-        SongDbRequest::GetSong(song_id) => {
-            match song_db.songs.values().flat_map(|songs| songs.iter()).find(|s| s.id == song_id) {
-                Some(song) => {
-                    match song_db.get_song_data(&song_id) {
-                        Ok(song_data) => SongDbResponse::Song(Song {
-                            id: song.id.clone(),
-                            name: song.name.clone(),
-                            data: song_data,
-                            tag: song.tag.clone(),
-                        }),
-                        Err(_) => SongDbResponse::Error("Failed to retrieve song data".to_string()),
-                    }
-                },
-                None => SongDbResponse::Error("Song not found".to_string()),
-            }
-        }
-
         SongDbRequest::GetAllTags => {
             let tags = song_db.get_all_tags();
-            SongDbResponse::Tags(tags.into_iter().cloned().collect())
+            Response::new()
+                .body(serde_json::to_vec(&SongDbResponse::Tags(tags.into_iter().cloned().collect()))?)
+                .send()?;
         }
+    }
 
-        SongDbRequest::AddSong(song) => {
-            match song_db.add_song(song) {
-                Ok(_) => SongDbResponse::SongAdded,
-                Err(_) => SongDbResponse::Error("Failed to add song".to_string()),
+    Ok(())
+}
+
+fn handle_http_request(
+    our: &Address,
+    source: &Address,
+    body: &[u8],
+    song_db: &mut SongDb,
+    ws_channels: &mut HashSet<u32>,
+) -> anyhow::Result<()> {
+    let http_request = serde_json::from_slice::<HttpServerRequest>(body)?;
+
+    match http_request {
+        HttpServerRequest::Http(request) => {
+            let method = request.method()?;
+            let path = request.path()?;
+
+            match (method.as_str(), path.as_str()) {
+                ("GET", "/get_songs_from_tag") => {
+                    let tag = request.query_params().get("tag").ok_or_else(|| anyhow::anyhow!("No tag provided"))?;
+                    let songs = song_db.get_songs_by_tag(tag);
+                    let response = serde_json::to_vec(&songs)?;
+                    send_response(StatusCode::OK, Some(HashMap::from([("Content-Type".to_string(), "application/json".to_string())])), response);
+                }
+
+                ("GET", "/list_all_songs") => {
+                    let all_songs: Vec<_> = song_db.songs.values().flatten().map(|song| {
+                        serde_json::json!({
+                            "id": song.id,
+                            "name": song.name,
+                            "tag": song.tag,
+                        })
+                    }).collect();
+                    
+                    let response = serde_json::to_vec(&all_songs)?;
+                    send_response(StatusCode::OK, Some(HashMap::from([("Content-Type".to_string(), "application/json".to_string())])), response);
+                }
+                ("GET", "/stream_audio") => {
+                    let song_id = request.query_params().get("id").ok_or_else(|| anyhow::anyhow!("No song ID provided"))?;
+                    let file_path = format!("{}/{}", song_db.vfs_dir_path, song_id);
+                    
+                    match open_file(&file_path, false, None) {
+                        Ok(file) => {
+                            let data = file.read()?;
+                            let mut headers = HashMap::new();
+                            headers.insert("Content-Type".to_string(), "audio/mpeg".to_string());
+                            headers.insert("Content-Length".to_string(), data.len().to_string());
+                            send_response(StatusCode::OK, Some(headers), data);
+                        },
+                        Err(_) => {
+                            send_response(StatusCode::NOT_FOUND, None, b"Audio file not found".to_vec());
+                        }
+                    }
+                }
+                ("POST", "/upload_song") => {
+
+                    let blob = get_blob().ok_or_else(|| anyhow::anyhow!("No blob provided for song upload"))?;
+
+                    println!("Received upload request with blob size: {}", blob.bytes.len());
+    
+                    // Create a longer-lived value for content_type
+                    let content_type = request.headers()
+                        .get("Content-Type")
+                        .ok_or_else(|| anyhow::anyhow!("upload, Content-Type header not found"))?
+                        .to_str()
+                        .map_err(|_| anyhow::anyhow!("failed to convert Content-Type to string"))?
+                        .to_owned(); // Convert to an owned String
+
+                    println!("Content-Type: {}", content_type);
+                
+                    let boundary_parts: Vec<&str> = content_type.split("boundary=").collect();
+                    let boundary = boundary_parts.get(1)
+                        .ok_or_else(|| anyhow::anyhow!("upload fail, no boundary found in POST content type"))?;
+
+                    println!("Boundary: {}", boundary);
+                
+                    let data = std::io::Cursor::new(blob.bytes);
+                    let mut multipart = multipart::server::Multipart::with_body(data, *boundary);
+                    
+                    let mut name = String::new();
+                    let mut tag_key = String::new();
+                    let mut song_data = Vec::new();
+
+
+
+                    while let Some(mut field) = multipart.read_entry().map_err(|e| anyhow::anyhow!("Error reading multipart entry: {:?}", e))? {
+                        println!("Processing field: {}", field.headers.name);
+                        match field.headers.name.as_ref() {
+                            "name" => { field.data.read_to_string(&mut name)?; }
+                            "tag" => { field.data.read_to_string(&mut tag_key)?; }
+                            "file" => { 
+                                if let Some(filename) = field.headers.filename.clone() {
+                                    field.data.read_to_end(&mut song_data)?;
+                                    println!("Uploaded file {} with size {}", filename, song_data.len());
+                                } else {
+                                    println!("File field found but no filename provided");
+                                }
+                            }
+                            _ => { println!("Unexpected field: {}", field.headers.name); }
+                        }
+                    }
+
+                    if name.is_empty() {
+                        println!("Error: 'name' field is missing.");
+                    }
+                    if tag_key.is_empty() {
+                        println!("Error: 'tag' field is missing.");
+                    }
+                    if song_data.is_empty() {
+                        println!("Error: 'file' field is missing.");
+                    }
+                    
+                    if name.is_empty() || tag_key.is_empty() || song_data.is_empty() {
+                        send_response(StatusCode::BAD_REQUEST, None, b"Missing required fields for song upload".to_vec());
+                        return Ok(());
+                    }
+
+                    println!("Creating song with name: {}, tag: {}, data size: {}", name, tag_key, song_data.len());
+
+                    let song = Song {
+                        id: format!("{}.mp3", name),
+                        name,
+                        data: song_data,
+                        tag: Tag { key: tag_key.clone(), name: Some(tag_key) },
+                    };
+
+                    match song_db.add_song(song) {
+                        Ok(_) => {
+                            send_response(StatusCode::OK, None, b"Song uploaded successfully".to_vec());
+                            push_update_via_ws(ws_channels, "Song uploaded successfully");
+                        }
+                        Err(e) => {
+                            send_response(StatusCode::INTERNAL_SERVER_ERROR, None, format!("Failed to upload song: {}", e).into_bytes());
+                        }
+                    }
+                }
+                _ => {
+                    send_response(StatusCode::NOT_FOUND, None, b"Not Found".to_vec());
+                }
             }
         }
-    };
-
-    let response_body = serde_json::to_vec(&response)?;
-    Response::new().body(response_body).send()?;
-    Ok(())
-
-}
-
-
-fn add_local_files_to_vfs(song_db: &mut SongDb, local_dir: &str) -> anyhow::Result<()> {
-    for entry in fs::read_dir(local_dir)? {
-        print!("trying to add {:?}", &entry);
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("mp3") {
-            let file_name = path.file_name().unwrap().to_str().unwrap();
-            let file_content = fs::read(&path)?;
-            let tag = Tag {
-                key: "uuid-1".to_string(),
-                name: Some("eine_kleine_klitz_musik".to_string()),
-            };
-            let song = Song {
-                id: file_name.to_string(),
-                name: file_name.to_string(),
-                data: file_content,
-                tag: tag,
-            };
-            song_db.add_song(song)?;
+        HttpServerRequest::WebSocketOpen { channel_id, .. } => {
+            ws_channels.insert(channel_id);
         }
-        print!("{:?} added", &entry);
+        HttpServerRequest::WebSocketClose(channel_id) => {
+            ws_channels.remove(&channel_id);
+        }
+        HttpServerRequest::WebSocketPush { .. } => {}
     }
+
     Ok(())
 }
+
+fn push_update_via_ws(ws_channels: &HashSet<u32>, update: &str) {
+    for &channel_id in ws_channels {
+        send_ws_push(
+            channel_id,
+            WsMessageType::Text,
+            LazyLoadBlob {
+                mime: Some("application/json".to_string()),
+                bytes: serde_json::json!({
+                    "type": "update",
+                    "data": update
+                })
+                .to_string()
+                .into_bytes(),
+            },
+        );
+    }
+}
+

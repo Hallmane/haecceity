@@ -7,18 +7,27 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug)]
 pub enum IncomingMessage {
     Http(IncomingHttpRequest),
-    WebSocketOpen { path: String, channel_id: u32 },
-    WebSocketClose(u32),
-    WebSocketPush { channel_id: u32, message_type: WsMessageType },
+    //WebSocketOpen { path: String, channel_id: u32 },
+    //WebSocketClose(u32),
+    //WebSocketPush { channel_id: u32, message_type: WsMessageType },
     SongDb(SongDbRequest),
+    Peer(SongDbRequest),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SongDbRequest{
     GetSongsByTag(String),
-    GetSong(String),
+    //GetSong(String),
     GetAllTags,
-    AddSong(Song),
+    //AddSong(Song),
+    UploadSong(UploadSongRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadSongRequest {
+    pub name: String,
+    pub tag: Tag,
+    //data in blob
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,8 +72,10 @@ impl SongDb {
 
     pub fn add_song(&mut self, mut song: Song) -> anyhow::Result<()> {
         let file_path = format!("{}/{}", self.vfs_dir_path, song.id);
-        let mut file = vfs::create_file(&file_path, Some(5))?;
+        let mut file = vfs::create_file(&file_path, None)?;
         file.write_all(&song.data)?;
+
+        println!("Saved file to: {}", file_path);
 
         // Clear the data after writing to file to save memory
         song.data.clear();
@@ -77,8 +88,9 @@ impl SongDb {
         Ok(())
     }
 
-    pub fn get_songs_by_tag(&self, tag: &str) -> Option<&Vec<Song>> {
-        self.songs.get(tag)
+    pub fn get_songs_by_tag(&self, tag: &str) -> Vec<Song> {
+        self.songs.get(tag).cloned().unwrap_or_else(Vec::new)
+
     }
 
     // so will this be the thing that the backend hits when the front end asks for playback of a single file?
