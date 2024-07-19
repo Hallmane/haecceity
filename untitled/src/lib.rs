@@ -1,5 +1,5 @@
 use kinode_process_lib::{
-    await_message, get_typed_state, get_blob, call_init, http::{
+    await_message, call_init, clear_state, get_blob, get_typed_state, http::{
         bind_http_path, bind_ws_path, send_response, send_ws_push, serve_ui, HttpServerRequest,
         StatusCode, WsMessageType,
     }, our_capabilities, println, set_state, spawn, vfs::{
@@ -21,6 +21,8 @@ wit_bindgen::generate!({
 call_init!(init);
 fn init(our: Address) {
     println!("P2P Music Sharing: Initializing");
+
+    //clear_state();
 
     let drive_path = create_drive(our.package_id(), "music_db", None).unwrap();
     let files_dir = open_dir(&drive_path, false, None).unwrap();
@@ -77,6 +79,7 @@ fn handle_songdb_request(
     ws_channels: &mut HashSet<u32>,
 ) -> anyhow::Result<()> {
     let request = serde_json::from_slice::<SongDbRequest>(body)?;
+    println!("song_db_request handler:");
 
     match request {
         SongDbRequest::GetSongsByTag(tag) => {

@@ -16,6 +16,7 @@ const SongSearch: React.FC = () => {
 
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadTag, setUploadTag] = useState('');
+  const [uploadName, setUploadName] = useState('');
 
   const audioRef = useRef<HTMLAudioElement>(null);
 
@@ -85,6 +86,7 @@ const SongSearch: React.FC = () => {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       setUploadFile(e.target.files[0]);
+      setUploadName(e.target.files[0].name)
     }
   };
 
@@ -97,7 +99,8 @@ const SongSearch: React.FC = () => {
     const formData = new FormData();
     formData.append('file', uploadFile);
     formData.append('tag', uploadTag);
-    formData.append('name', "fake_name");
+    formData.append('name', uploadName);
+    //formData.append('name', "fake_name");
 
     try {
       const response = await fetch(`${import.meta.env.BASE_URL}/upload_song`, {
